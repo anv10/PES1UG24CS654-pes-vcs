@@ -15,7 +15,10 @@
 // PROVIDED functions: index_find, index_remove, index_status
 // TODO functions:     index_load, index_save, index_add
 
+#include "pes.h"
 #include "index.h"
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,10 +138,38 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+
+    index->count = 0;
+
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) {
+        // file doesn't exist → empty index (NOT error)
+        return 0;
+    }
+
+    char path[256], hash_hex[HASH_HEX_SIZE + 1];
+    unsigned int mode;
+    long mtime;
+    size_t size;
+
+    while (fscanf(f, "%o %64s %ld %zu %255s\n",
+                  &mode, hash_hex, &mtime, &size, path) == 5) {
+
+        IndexEntry *e = &index->entries[index->count++];
+
+        e->mode = mode;
+        e->mtime_sec = mtime;
+        e->size = size;
+        strcpy(e->path, path);
+
+        if (hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -151,11 +182,40 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+int compare_entries(const void *a, const void *b) {
+    return strcmp(((IndexEntry *)a)->path, ((IndexEntry *)b)->path);
+}
+
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+
+    // Create a sorted copy
+    Index temp = *index;
+    qsort(temp.entries, temp.count, sizeof(IndexEntry), compare_entries);
+
+    FILE *f = fopen(".pes/index.tmp", "w");
+    if (!f) return -1;
+
+    for (int i = 0; i < temp.count; i++) {
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&temp.entries[i].hash, hex);
+
+        fprintf(f, "%o %s %ld %u %s\n",
+                temp.entries[i].mode,
+                hex,
+                temp.entries[i].mtime_sec,
+                temp.entries[i].size,
+                temp.entries[i].path);
+    }
+
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    // Atomic rename
+    if (rename(".pes/index.tmp", ".pes/index") != 0)
+        return -1;
+
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -168,8 +228,55 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size < 0) {
+        fclose(f);
+        return -1;
+    }
+
+    void *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (size > 0 && fread(data, 1, size, f) != (size_t)size) {
+        fclose(f);
+        free(data);
+        return -1;
+    }
+    fclose(f);
+
+    ObjectID id;
+    if (object_write(OBJ_BLOB, data, size, &id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+
+    IndexEntry *e = index_find(index, path);
+
+    if (!e) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        e = &index->entries[index->count++];
+    }
+
+    e->mode = st.st_mode & 0777;
+    e->mtime_sec = st.st_mtime;
+    e->size = st.st_size;
+    strcpy(e->path, path);
+    e->hash = id;
+
+    return index_save(index);
 }
